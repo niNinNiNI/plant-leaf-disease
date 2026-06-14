@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "paddleocr-text-recognition": {
+      "source": "aidenwu0209/paddleocr-skills",
+      "sourceType": "github",
+      "skillPath": "skills/paddleocr-text-recognition/SKILL.md",
+      "computedHash": "c8c3cd9d4f95a4f0876de8515608c23ef565f238e7952da386e337c67ba93800"
+    }
+  }
+}

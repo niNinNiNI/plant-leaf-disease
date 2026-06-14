@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints (too large for GitHub)
+checkpoints/
+
+# Archive (old runs, too large)
+archive/
+
+# Tool caches
+.codegraph/
+.claude/
+.agents/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

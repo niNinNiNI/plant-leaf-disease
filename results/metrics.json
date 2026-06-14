@@ -1,0 +1,12 @@
+{
+  "model": "transfer_resnet50",
+  "epochs": 80,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "dropout": 0.5,
+  "loss_function": "focal",
+  "accuracy": 0.9789983844911146,
+  "precision": 0.9766066293136154,
+  "recall": 0.9839846306370872,
+  "f1": 0.980076819565921
+}
