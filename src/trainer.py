@@ -9,7 +9,39 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import (
     ReduceLROnPlateau, CosineAnnealingLR, StepLR, OneCycleLR
 )
+import numpy as np
 from tqdm import tqdm
+
+
+def mixup_data(x, y, alpha=0.2):
+    """
+    MixUp 数据增强: 随机混合两个 batch 中的样本
+
+    公式:
+        λ ~ Beta(α, α)
+        mixed_x = λ * x + (1-λ) * x[shuffled]
+        mixed_y = λ * y_onehot + (1-λ) * y_onehot[shuffled]
+
+    返回:
+        mixed_x, y_a, y_b, lam
+        损失计算: loss = lam * criterion(output, y_a) + (1-lam) * criterion(output, y_b)
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """MixUp 损失: 对两个标签分别计算损失的加权和"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 def get_scheduler(optimizer, scheduler_type='cosine', **kwargs):
@@ -63,7 +95,10 @@ class Trainer:
                  early_stop_patience=15,
                  save_dir='./checkpoints',
                  log_dir='./logs',
-                 grad_clip_max_norm=1.0):
+                 grad_clip_max_norm=1.0,
+                 use_mixup=False,
+                 mixup_alpha=0.2,
+                 start_epoch=1):
 
         self.model = model.to(device)
         self.device = device
@@ -79,6 +114,10 @@ class Trainer:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
 
+        # MixUp 数据增强
+        self.use_mixup = use_mixup
+        self.mixup_alpha = mixup_alpha
+
         # TensorBoard
         self.writer = SummaryWriter(log_dir)
 
@@ -93,6 +132,7 @@ class Trainer:
         self.best_epoch = 0
         self.epochs_without_improvement = 0
         self.epoch_times = []
+        self.start_epoch = start_epoch
 
     def train_epoch(self, train_loader, epoch):
         """训练一个 epoch"""
@@ -106,10 +146,19 @@ class Trainer:
         for images, labels in pbar:
             images, labels = images.to(self.device), labels.to(self.device)
 
+            # MixUp 数据增强
+            if self.use_mixup:
+                images, labels_a, labels_b, lam = mixup_data(
+                    images, labels, alpha=self.mixup_alpha
+                )
+
             # 混合精度训练
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+                if self.use_mixup:
+                    loss = mixup_criterion(self.criterion, outputs, labels_a, labels_b, lam)
+                else:
+                    loss = self.criterion(outputs, labels)
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -126,10 +175,15 @@ class Trainer:
             if isinstance(self.scheduler, OneCycleLR):
                 self.scheduler.step()
 
-            # 统计
+            # 统计 (MixUp 模式下用原始 labels 的预测准确率作为粗略参考)
             running_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
-            correct += predicted.eq(labels).sum().item()
+            if self.use_mixup:
+                # 用 lam 加权估计正确数
+                correct += (lam * predicted.eq(labels_a).float().sum()
+                            + (1 - lam) * predicted.eq(labels_b).float().sum()).item()
+            else:
+                correct += predicted.eq(labels).sum().item()
             total += labels.size(0)
 
             pbar.set_postfix({
@@ -186,15 +240,19 @@ class Trainer:
 
     def train(self, train_loader, val_loader, epochs=50):
         """完整训练流程"""
+        resume_msg = f" (从 epoch {self.start_epoch} 恢复)" if self.start_epoch > 1 else ""
         print(f"\n{'='*60}")
-        print(f"开始训练 ({epochs} epochs)")
+        print(f"开始训练 ({epochs} epochs){resume_msg}")
         print(f"{'='*60}")
         print(f"  设备: {self.device}")
         print(f"  优化器: {type(self.optimizer).__name__}")
         print(f"  混合精度: {self.use_amp}")
+        print(f"  MixUp: {self.use_mixup}" + (f" (alpha={self.mixup_alpha})" if self.use_mixup else ""))
         print(f"  早停耐心值: {self.early_stop_patience}")
+        if self.start_epoch > 1:
+            print(f"  当前最佳 Val Acc: {self.best_val_acc:.2f}% (epoch {self.best_epoch})")
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(self.start_epoch, epochs + 1):
             epoch_start = time.time()
 
             # 训练
@@ -283,7 +341,8 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'val_acc': val_acc,
             'best_val_acc': self.best_val_acc,
-            'history': self.history
+            'history': self.history,
+            'epochs_without_improvement': self.epochs_without_improvement
         }
 
         if self.scheduler:

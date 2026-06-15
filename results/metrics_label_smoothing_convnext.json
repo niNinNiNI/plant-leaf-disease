@@ -1,0 +1,20 @@
+{
+  "model": "transfer_convnext_tiny",
+  "epochs": 80,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "dropout": 0.5,
+  "loss_function": "label_smoothing",
+  "image_size": 224,
+  "mixup": false,
+  "accuracy": 0.9754442649434572,
+  "precision": 0.9674133558289602,
+  "recall": 0.9812154673697241,
+  "f1": 0.9737777184279284,
+  "tta_accuracy": 0.9861066235864298,
+  "tta_precision": 0.9784069432193149,
+  "tta_recall": 0.9891779481485125,
+  "tta_f1": 0.9833220470651639,
+  "tta_mode": "simple",
+  "tta_num_views": 2
+}

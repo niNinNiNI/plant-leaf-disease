@@ -35,7 +35,7 @@ from src.dataset import split_dataset, compute_class_weights, create_dataloaders
 from src.models import create_model
 from src.losses import get_criterion
 from src.trainer import Trainer, get_scheduler
-from src.evaluate import evaluate_on_test, analyze_misclassified
+from src.evaluate import evaluate_on_test, analyze_misclassified, evaluate_with_tta
 from src.gradcam import visualize_gradcam
 from src.ablation import run_ablation_study, visualize_ablation_results
 
@@ -66,16 +66,36 @@ def parse_args():
                         choices=['cross_entropy', 'focal', 'label_smoothing'])
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['cosine', 'plateau', 'step', 'onecycle'])
+    parser.add_argument('--mixup', action='store_true',
+                        help='使用 MixUp 数据增强')
+    parser.add_argument('--mixup_alpha', type=float, default=0.2,
+                        help='MixUp Beta 分布参数 (default: 0.2)')
+    parser.add_argument('--image_size', type=int, default=224,
+                        help='输入图像尺寸, 推荐224/384 (default: 224)')
+    parser.add_argument('--unfreeze_strategy', type=str, default='auto',
+                        choices=['auto', 'last_n_params', 'stages'],
+                        help='骨干解冻策略: auto=自动选择, last_n_params=参数级, stages=阶段级')
+    parser.add_argument('--unfreeze_stages', type=int, default=2,
+                        help='解冻最后几个 stage (仅 stages 策略有效, default: 2)')
 
     # 模式
     parser.add_argument('--eval_only', action='store_true',
                         help='仅评估（不训练）')
+    parser.add_argument('--tta', action='store_true',
+                        help='使用测试时增强 (TTA) 评估')
+    parser.add_argument('--tta_mode', type=str, default='simple',
+                        choices=['simple', 'full'],
+                        help='TTA 模式: simple=2视图, full=10视图 (default: simple)')
     parser.add_argument('--gradcam', action='store_true',
                         help='生成 Grad-CAM 可视化')
     parser.add_argument('--ablation', action='store_true',
                         help='运行消融实验')
     parser.add_argument('--finetune', action='store_true',
                         help='运行二阶段微调')
+    parser.add_argument('--resume', action='store_true',
+                        help='从 checkpoint 恢复训练（断点续训）')
+    parser.add_argument('--skip_phase1', action='store_true',
+                        help='跳过阶段一，直接进入微调阶段（需配合 --resume 和 --finetune）')
 
     # 路径
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -139,7 +159,7 @@ def main():
         val_ratio=Config.VAL_RATIO,
         test_ratio=Config.TEST_RATIO,
         seed=args.seed,
-        image_size=Config.IMAGE_SIZE
+        image_size=args.image_size
     )
 
     num_classes = len(class_to_idx)
@@ -186,15 +206,25 @@ def main():
     # ============================================================
     if args.eval_only:
         print("\n" + "=" * 60)
-        print("评估模式")
+        print("评估模式" + (" (含 TTA)" if args.tta else ""))
         print("=" * 60)
         checkpoint_path = args.checkpoint or f'checkpoints/{args.model}_{args.backbone}/best_model.pth'
         model = model.to(device)
-        results = evaluate_on_test(
-            model, test_loader, class_names, device,
-            checkpoint_path=checkpoint_path
-        )
-        analyze_misclassified(model, test_dataset, idx_to_class, device)
+
+        if args.tta:
+            # TTA 评估
+            results = evaluate_with_tta(
+                model, test_dataset, class_names, device,
+                checkpoint_path=checkpoint_path,
+                tta_mode=args.tta_mode
+            )
+        else:
+            # 标准评估
+            results = evaluate_on_test(
+                model, test_loader, class_names, device,
+                checkpoint_path=checkpoint_path
+            )
+            analyze_misclassified(model, test_dataset, idx_to_class, device)
         return
 
     # ============================================================
@@ -250,9 +280,17 @@ def main():
     )
     print(f"调度器: {args.scheduler}")
 
-    # 创建训练器
-    save_dir = f'checkpoints/{args.model}_{args.backbone}'
-    log_dir = f'results/logs/{args.model}_{args.backbone}'
+    # 创建训练器 — 构建唯一实验标签
+    loss_suffix = f'_{args.loss}' if args.loss != 'cross_entropy' else ''
+    mixup_suffix = '_mixup' if args.mixup else ''
+    size_suffix = f'_{args.image_size}' if args.image_size != 224 else ''
+    # 非默认解冻策略也纳入标签，避免新旧日志混淆
+    unfreeze_suffix = ''
+    if args.unfreeze_strategy != 'auto' or args.unfreeze_stages != 2:
+        unfreeze_suffix = f'_uf{args.unfreeze_strategy}{args.unfreeze_stages}'
+    experiment_tag = f'{loss_suffix}{mixup_suffix}{size_suffix}{unfreeze_suffix}'
+    save_dir = f'checkpoints/{args.model}_{args.backbone}{experiment_tag}'
+    log_dir = f'results/logs/{args.model}_{args.backbone}{experiment_tag}'
     trainer = Trainer(
         model=model,
         device=device,
@@ -263,20 +301,76 @@ def main():
         early_stop_patience=Config.EARLY_STOP_PATIENCE,
         save_dir=save_dir,
         log_dir=log_dir,
-        grad_clip_max_norm=Config.GRAD_CLIP_MAX_NORM
+        grad_clip_max_norm=Config.GRAD_CLIP_MAX_NORM,
+        use_mixup=args.mixup,
+        mixup_alpha=args.mixup_alpha
     )
 
-    # ---- 阶段一: 冻结骨干训练 ----
-    print(f"\n{'='*60}")
-    print(f"阶段一: 训练分类头 (冻结骨干, {args.epochs} epochs)")
-    print(f"{'='*60}")
-    history = trainer.train(train_loader, val_loader, epochs=args.epochs)
+    # ---- 断点续训 ----
+    if args.resume:
+        resume_path = args.checkpoint or os.path.join(save_dir, 'best_model.pth')
+        if not os.path.exists(resume_path):
+            print(f"错误: 找不到 checkpoint: {resume_path}")
+            sys.exit(1)
 
-    # 绘制训练曲线
-    plot_training_curves(
-        history,
-        save_path=f'results/figures/training_curves_{args.model}_{args.backbone}.png'
-    )
+        print(f"\n{'='*60}")
+        print(f"从 checkpoint 恢复训练")
+        print(f"{'='*60}")
+        print(f"  路径: {resume_path}")
+
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scheduler and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        resumed_epoch = checkpoint.get('epoch', 0)
+        trainer.start_epoch = resumed_epoch + 1
+        trainer.best_val_acc = checkpoint.get('best_val_acc', 0)
+        trainer.best_epoch = checkpoint.get('epoch', 0)
+        trainer.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
+
+        # 恢复训练历史（确保是 dict 类型）
+        saved_history = checkpoint.get('history', None)
+        if saved_history is not None and isinstance(saved_history, dict):
+            trainer.history = saved_history
+
+        print(f"  已恢复 epoch: {resumed_epoch}")
+        print(f"  最佳 Val Acc: {trainer.best_val_acc:.2f}%")
+        print(f"  将从 epoch {trainer.start_epoch} 继续训练")
+
+    # ---- 判断是否跳过阶段一 ----
+    skip_phase1 = args.skip_phase1 or (args.resume and args.finetune)
+
+    if skip_phase1:
+        print(f"\n{'='*60}")
+        print(f"跳过阶段一，直接进入微调阶段")
+        print(f"{'='*60}")
+        # 从 checkpoint 加载最佳模型权重（如果尚未通过 resume 加载）
+        resume_path = args.checkpoint or os.path.join(save_dir, 'best_model.pth')
+        if not args.resume and os.path.exists(resume_path):
+            checkpoint = torch.load(resume_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            best_val_acc = checkpoint.get('val_acc', checkpoint.get('best_val_acc', 0))
+            best_epoch = checkpoint.get('epoch', 0)
+            print(f"  已加载 checkpoint: {resume_path}")
+            print(f"  阶段一最佳 Val Acc: {best_val_acc:.2f}% (epoch {best_epoch})")
+        elif args.resume:
+            print(f"  已通过 --resume 加载模型，阶段一最佳 Val Acc: {trainer.best_val_acc:.2f}%")
+        elif not os.path.exists(resume_path):
+            print(f"  警告: 未找到 checkpoint ({resume_path})，将从随机初始化继续")
+    else:
+        # ---- 阶段一: 冻结骨干训练 ----
+        print(f"\n{'='*60}")
+        print(f"阶段一: 训练分类头 (冻结骨干, {args.epochs} epochs)")
+        print(f"{'='*60}")
+        history = trainer.train(train_loader, val_loader, epochs=args.epochs)
+
+        # 绘制训练曲线
+        plot_training_curves(
+            history,
+            save_path=f'results/figures/training_curves_{args.model}_{args.backbone}{experiment_tag}.png'
+        )
 
     # ---- 阶段二: 微调（可选） ----
     if args.finetune and args.model == 'transfer':
@@ -284,15 +378,43 @@ def main():
         print("阶段二: 微调 (解冻骨干最后几层)")
         print(f"{'='*60}")
 
-        model.unfreeze_backbone(num_layers_to_unfreeze=30)
+        # 智能解冻: auto 策略对 ConvNeXt 使用 stage 级解冻, 对 ResNet 使用参数级
+        if args.unfreeze_strategy == 'stages':
+            model.unfreeze_backbone(
+                num_layers_to_unfreeze=args.unfreeze_stages,
+                strategy='stages'
+            )
+        elif args.unfreeze_strategy == 'last_n_params':
+            model.unfreeze_backbone(
+                num_layers_to_unfreeze=30,
+                strategy='last_n_params'
+            )
+        else:  # auto
+            model.unfreeze_backbone(
+                num_layers_to_unfreeze=args.unfreeze_stages
+                if args.backbone.startswith('convnext') else 30,
+                strategy='auto'
+            )
 
+        # 只优化可训练参数
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         trainer.optimizer = optim.AdamW(
-            model.parameters(), lr=Config.FINETUNE_LR, weight_decay=Config.WEIGHT_DECAY
+            trainable_params, lr=Config.FINETUNE_LR, weight_decay=Config.WEIGHT_DECAY
         )
         trainer.scheduler = CosineAnnealingLR(
             trainer.optimizer, T_max=Config.FINETUNE_EPOCHS, eta_min=1e-6
         )
+        # 重置早停相关状态
         trainer.early_stop_patience = 10
+        trainer.best_val_acc = 0.0
+        trainer.best_epoch = 0
+        trainer.epochs_without_improvement = 0
+        trainer.start_epoch = 1
+        trainer.history = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': [],
+            'lr': []
+        }
 
         history_finetune = trainer.train(
             train_loader, val_loader, epochs=Config.FINETUNE_EPOCHS
@@ -300,7 +422,7 @@ def main():
 
         plot_training_curves(
             history_finetune,
-            save_path=f'results/figures/training_curves_finetune_{args.model}_{args.backbone}.png'
+            save_path=f'results/figures/training_curves_finetune_{args.model}_{args.backbone}{experiment_tag}.png'
         )
 
     # ============================================================
@@ -319,6 +441,44 @@ def main():
     # 错误样本分析
     analyze_misclassified(model, test_dataset, idx_to_class, device)
 
+    # ---- 准备评估指标（供 TTA 追加） ----
+    import json
+    metrics = {
+        'model': f'{args.model}_{args.backbone}',
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
+        'learning_rate': args.lr,
+        'dropout': args.dropout,
+        'loss_function': args.loss,
+        'image_size': args.image_size,
+        'mixup': args.mixup,
+        'accuracy': float(results['accuracy']),
+        'precision': float(results['precision']),
+        'recall': float(results['recall']),
+        'f1': float(results['f1']),
+    }
+
+    # ---- TTA 评估（可选） ----
+    if args.tta:
+        print(f"\n{'='*60}")
+        print(f"TTA 评估 (模式: {args.tta_mode})")
+        print(f"{'='*60}")
+        tta_results = evaluate_with_tta(
+            model, test_dataset, class_names, device,
+            checkpoint_path=best_checkpoint,
+            tta_mode=args.tta_mode
+        )
+
+        # 在 metrics 中追加 TTA 指标
+        metrics['tta_accuracy'] = float(tta_results['accuracy'])
+        metrics['tta_precision'] = float(tta_results['precision'])
+        metrics['tta_recall'] = float(tta_results['recall'])
+        metrics['tta_f1'] = float(tta_results['f1'])
+        metrics['tta_mode'] = args.tta_mode
+        metrics['tta_num_views'] = tta_results['num_views']
+        print(f"\n  TTA 准确率: {tta_results['accuracy']*100:.2f}%")
+        print(f"  TTA F1:     {tta_results['f1']*100:.2f}%")
+
     # ============================================================
     # Grad-CAM 可视化
     # ============================================================
@@ -334,21 +494,8 @@ def main():
     # ============================================================
     # 保存评估指标
     # ============================================================
-    import json
-    metrics_path = 'results/metrics.json'
+    metrics_path = f'results/metrics{experiment_tag}.json'
     os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
-    metrics = {
-        'model': f'{args.model}_{args.backbone}',
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'learning_rate': args.lr,
-        'dropout': args.dropout,
-        'loss_function': args.loss,
-        'accuracy': float(results['accuracy']),
-        'precision': float(results['precision']),
-        'recall': float(results['recall']),
-        'f1': float(results['f1']),
-    }
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
     print(f"\n评估指标已保存到: {metrics_path}")

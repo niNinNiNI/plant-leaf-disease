@@ -278,24 +278,45 @@ class TransferLearningModel(nn.Module):
         elif backbone_name.startswith('mobilenet'):
             self.backbone.classifier = new_classifier
         elif backbone_name.startswith('convnext'):
-            self.backbone.classifier = new_classifier
+            # ConvNeXt 分类头结构: Sequential(LayerNorm2d, Flatten, Linear)
+            # 保留 LayerNorm 和 Flatten，只替换最后的 Linear 层
+            self.backbone.classifier = nn.Sequential(
+                self.backbone.classifier[0],  # LayerNorm2d
+                self.backbone.classifier[1],  # Flatten
+                new_classifier                # 自定义分类头
+            )
         else:
             self.backbone.fc = new_classifier
 
     def forward(self, x):
         return self.backbone(x)
 
-    def unfreeze_backbone(self, num_layers_to_unfreeze=None):
+    def unfreeze_backbone(self, num_layers_to_unfreeze=None, strategy='auto'):
         """
-        逐步解冻骨干网络用于微调
+        逐步解冻骨干网络用于微调。
 
         参数:
-            num_layers_to_unfreeze: 解冻最后 N 层。None 表示全部解冻。
+            num_layers_to_unfreeze: 解冻最后 N 层参数。None 表示全部解冻。
+                (仅 strategy='last_n_params' 时有效)
+            strategy: 解冻策略:
+                - 'auto': 根据骨干架构自动选择最佳策略
+                - 'last_n_params': 按参数张量顺序解冻最后 N 个 (旧行为)
+                - 'stages': 按 stage/block 解冻最后 N 个阶段
+                  (适用于 ConvNeXt, EfficientNet, ResNet 等具名模块架构)
         """
+        if strategy == 'auto':
+            if self.backbone_name.startswith('convnext'):
+                strategy = 'stages'
+            else:
+                strategy = 'last_n_params'
+
         if num_layers_to_unfreeze is None:
             for param in self.backbone.parameters():
                 param.requires_grad = True
+        elif strategy == 'stages':
+            self._unfreeze_by_stages(num_layers_to_unfreeze)
         else:
+            # last_n_params: 旧行为
             params = list(self.backbone.parameters())
             for param in params[:-num_layers_to_unfreeze]:
                 param.requires_grad = False
@@ -304,7 +325,86 @@ class TransferLearningModel(nn.Module):
 
         trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.backbone.parameters())
+        unfrozen_modules = self._get_unfrozen_module_names()
         print(f"骨干网络: {trainable:,}/{total:,} 参数可训练 ({trainable/total*100:.1f}%)")
+        if unfrozen_modules:
+            print(f"  解冻模块: {', '.join(unfrozen_modules[:6])}"
+                  + (f' ... (+{len(unfrozen_modules)-6} 个)' if len(unfrozen_modules) > 6 else ''))
+
+    def _get_unfrozen_module_names(self):
+        """返回所有包含可训练参数的顶层模块名"""
+        unfrozen = set()
+        for name, module in self.backbone.named_modules():
+            has_trainable = any(p.requires_grad for p in module.parameters(recurse=False))
+            if has_trainable and name:
+                unfrozen.add(name.split('.')[0])
+        return sorted(unfrozen)
+
+    def _unfreeze_by_stages(self, num_stages_to_unfreeze):
+        """
+        按具名模块层级解冻最后几个 stage/block。
+        只在骨干的 DIRECT children 级别操作, 不递归进入内部子模块。
+
+        适配架构:
+          - ConvNeXt: features[1..7] = 4 stages + 3 downsamplers
+          - ResNet: layer1/2/3/4 (4 stages)
+          - EfficientNet: features[1..N] blocks
+          - DenseNet: features.denseblock1/2/3/4
+          - MobileNetV3: features[1..N] blocks
+        """
+        # 找到骨干的顶层容器（features 或直接子模块）
+        backbone = self.backbone
+
+        # 找到主要的特征提取容器
+        feature_container = None
+        for child_name in ['features', 'model']:
+            if hasattr(backbone, child_name):
+                feature_container = getattr(backbone, child_name)
+                break
+
+        if feature_container is None:
+            # 回退: 收集 backbone 的直接含参数子模块
+            direct_children = []
+            for name, module in backbone.named_children():
+                param_count = sum(p.numel() for p in module.parameters())
+                if param_count > 0:
+                    direct_children.append((name, module, param_count))
+        else:
+            # 收集 feature_container 的直接含参数子模块
+            direct_children = []
+            for name, module in feature_container.named_children():
+                param_count = sum(p.numel() for p in module.parameters())
+                if param_count > 0:
+                    direct_children.append((name, module, param_count))
+
+        if not direct_children:
+            # 回退: 使用参数级别解冻
+            print(f"  警告: 无法识别 stage 结构, 回退到参数级别解冻")
+            params = list(backbone.parameters())
+            n_params = min(num_stages_to_unfreeze * 15, len(params))
+            for param in params[:-n_params]:
+                param.requires_grad = False
+            for param in params[-n_params:]:
+                param.requires_grad = True
+            return
+
+        total_stages = len(direct_children)
+        unfreeze_start = max(0, total_stages - num_stages_to_unfreeze)
+
+        # 先全部冻结
+        for param in backbone.parameters():
+            param.requires_grad = False
+
+        # 解冻最后 num_stages_to_unfreeze 个直接子模块
+        unfrozen_names = []
+        for i in range(unfreeze_start, total_stages):
+            name, module, count = direct_children[i]
+            for param in module.parameters():
+                param.requires_grad = True
+            unfrozen_names.append(f"{name}({count:,})")
+
+        print(f"  Stage 解冻策略: 解冻最后 {num_stages_to_unfreeze}/{total_stages} 个顶层模块")
+        print(f"  目标模块: {', '.join(unfrozen_names)}")
 
 
 # ============================================================

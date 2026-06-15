@@ -1,0 +1,14 @@
+{
+  "model": "transfer_convnext_tiny",
+  "epochs": 80,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "dropout": 0.5,
+  "loss_function": "label_smoothing",
+  "image_size": 224,
+  "mixup": false,
+  "accuracy": 0.9802907915993538,
+  "precision": 0.977655118018079,
+  "recall": 0.9840369987064873,
+  "f1": 0.9806551407985857
+}
